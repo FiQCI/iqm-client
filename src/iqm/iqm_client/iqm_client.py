@@ -84,6 +84,7 @@ def update_batch_circuit_metadata(circuit_metadata, circuits):
 
     return circuits
 
+
 class IQMClient:
     """Provides access to IQM quantum computers.
 
