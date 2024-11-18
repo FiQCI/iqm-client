@@ -17,6 +17,7 @@ Client for connecting to the IQM quantum computer server interface.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from importlib.metadata import version
 import itertools
@@ -28,7 +29,9 @@ from typing import Any, Callable, Optional
 from uuid import UUID
 import warnings
 
+from packaging.version import parse
 import requests
+from requests import HTTPError
 
 from iqm.iqm_client.api import APIConfig, APIEndpoint, APIVariant
 from iqm.iqm_client.authentication import TokenManager
@@ -125,6 +128,8 @@ class IQMClient:
             env_var = os.environ.get('IQM_CLIENT_API_VARIANT')
             api_variant = APIVariant(env_var) if env_var else APIVariant.V1
         self._api = APIConfig(api_variant, url)
+        if (version_incompatibility_msg := self._check_versions()) is not None:
+            warnings.warn(version_incompatibility_msg)
 
     def __del__(self):
         try:
@@ -221,19 +226,19 @@ class IQMClient:
 
         for i, circuit in enumerate(circuits):
             try:
-                # validate the circuit against the local information in iqm.iqm_client.models._SUPPORTED_OPERATIONS
+                # validate the circuit against the static information in iqm.iqm_client.models._SUPPORTED_OPERATIONS
                 validate_circuit(circuit)
             except ValueError as e:
                 raise CircuitValidationError(f'The circuit at index {i} failed the validation').with_traceback(
                     e.__traceback__
                 )
 
-        architecture = self.get_quantum_architecture()
+        architecture = self.get_dynamic_quantum_architecture(calibration_set_id)
 
         self._validate_qubit_mapping(architecture, circuits, qubit_mapping)
         serialized_qubit_mapping = serialize_qubit_mapping(qubit_mapping) if qubit_mapping else None
 
-        # validate the circuit against the quantum architecture of the server
+        # validate the circuit against the calibration-dependent dynamic quantum architecture
         self._validate_circuit_instructions(
             architecture, circuits, qubit_mapping, validate_moves=options.move_gate_validation
         )
@@ -284,6 +289,8 @@ class IQMClient:
             )
         )
 
+        self._check_not_found_error(result)
+
         if result.status_code == 401:
             raise ClientAuthenticationError(f'Authentication failed: {result.text}')
 
@@ -300,7 +307,7 @@ class IQMClient:
 
     @staticmethod
     def _validate_qubit_mapping(
-        architecture: QuantumArchitectureSpecification,
+        architecture: DynamicQuantumArchitecture,
         circuits: CircuitBatch,
         qubit_mapping: Optional[dict[str, str]] = None,
     ) -> None:
@@ -335,12 +342,12 @@ class IQMClient:
 
         # check that each mapped qubit is defined in the quantum architecture
         for _logical, physical in qubit_mapping.items():
-            if physical not in architecture.qubits:
-                raise CircuitValidationError(f'Qubit {physical} not present in quantum architecture')
+            if physical not in architecture.components:
+                raise CircuitValidationError(f'Component {physical} not present in dynamic quantum architecture')
 
     @staticmethod
     def _validate_circuit_instructions(
-        architecture: QuantumArchitectureSpecification,
+        architecture: DynamicQuantumArchitecture,
         circuits: CircuitBatch,
         qubit_mapping: Optional[dict[str, str]] = None,
         validate_moves: MoveGateValidationMode = MoveGateValidationMode.STRICT,
@@ -372,11 +379,13 @@ class IQMClient:
 
     @staticmethod
     def _validate_instruction(
-        architecture: QuantumArchitectureSpecification,
+        architecture: DynamicQuantumArchitecture,
         instruction: Instruction,
         qubit_mapping: Optional[dict[str, str]] = None,
     ) -> None:
-        """Check that the instruction targets a valid qubit locus in the given quantum architecture.
+        """Validate an instruction against the dynamic quantum quantum architecture.
+
+        Checks that the instruction uses a valid implementation, and targets a valid locus.
 
         Args:
           architecture: quantum architecture to check against
@@ -387,53 +396,72 @@ class IQMClient:
         Raises:
             CircuitValidationError: validation failed
         """
-        if instruction.name not in architecture.operations:
-            raise CircuitValidationError(
-                f"Instruction '{instruction.name}' is not supported by the quantum architecture."
-            )
-        allowed_loci = architecture.operations[instruction.name]
-        op_info = _SUPPORTED_OPERATIONS[instruction.name]
+        op_info = _SUPPORTED_OPERATIONS.get(instruction.name)
+        if op_info is None:
+            raise CircuitValidationError(f"Unknown quantum operation '{instruction.name}'.")
+
         # apply the qubit mapping if any
-        qubits = [qubit_mapping[q] for q in instruction.qubits] if qubit_mapping else list(instruction.qubits)
+        mapped_qubits = tuple(qubit_mapping[q] for q in instruction.qubits) if qubit_mapping else instruction.qubits
 
-        if op_info.allow_all_loci:
+        def check_locus_components(allowed_components: Iterable[str], msg: str) -> None:
+            """Checks that the instruction locus consists of the allowed components only."""
+            for q, mapped_q in zip(instruction.qubits, mapped_qubits):
+                if mapped_q not in allowed_components:
+                    raise CircuitValidationError(
+                        f'{instruction!r}: Component {q} = {mapped_q} {msg}.'
+                        if qubit_mapping
+                        else f'{instruction!r}: Component {q} {msg}.'
+                    )
+
+        if op_info.no_calibration_needed:
             # all QPU loci are allowed
-            for q, mapped_q in zip(instruction.qubits, qubits):
-                if mapped_q not in architecture.qubits:
-                    raise CircuitValidationError(
-                        f'{instruction}: Qubit {q} = {mapped_q} does not exist on the QPU.'
-                        if qubit_mapping
-                        else f'{instruction}: Qubit {q} does not exist on the QPU.'
-                    )
-            return
-        if op_info.factorizable:
-            # Check that all qubits in the locus are allowed by the architecture
-            allowed_qubits = set(q for locus in allowed_loci for q in locus)
-            for q, mapped_q in zip(instruction.qubits, qubits):
-                if mapped_q not in allowed_qubits:
-                    raise CircuitValidationError(
-                        f'Qubit {q} = {mapped_q} is not allowed as locus for {instruction.name}'
-                        if qubit_mapping
-                        else f'Qubit {q} is not allowed as locus for {instruction.name}'
-                    )
+            check_locus_components(architecture.components, msg='does not exist on the QPU')
             return
 
-        # Check that locus matches one of the loci defined in architecture
+        gate_info = architecture.gates.get(instruction.name)
+        if gate_info is None:
+            raise CircuitValidationError(
+                f"Operation '{instruction.name}' is not supported by the dynamic quantum architecture."
+            )
+
+        if instruction.implementation is not None:
+            # specific implementation requested
+            impl_info = gate_info.implementations.get(instruction.implementation)
+            if impl_info is None:
+                raise CircuitValidationError(
+                    f"Operation '{instruction.name}' implementation '{instruction.implementation}' "
+                    f'is not supported by the dynamic quantum architecture.'
+                )
+            allowed_loci = impl_info.loci
+            instruction_name = f'{instruction.name}.{instruction.implementation}'
+        else:
+            # any implementation is fine
+            allowed_loci = gate_info.loci
+            instruction_name = f'{instruction.name}'
+
+        if op_info.factorizable:
+            # Check that all the locus components are allowed by the architecture
+            check_locus_components(
+                set(q for locus in allowed_loci for q in locus), msg=f"is not allowed as locus for '{instruction_name}'"
+            )
+            return
+
+        # Check that locus matches one of the allowed loci
         all_loci = (
-            [list(x) for locus in allowed_loci for x in itertools.permutations(locus)]
+            tuple(tuple(x) for locus in allowed_loci for x in itertools.permutations(locus))
             if op_info.symmetric
             else allowed_loci
         )
-        if qubits not in all_loci:
+        if mapped_qubits not in all_loci:
             raise CircuitValidationError(
-                f'{instruction.qubits} = {tuple(qubits)} not allowed as locus for {instruction.name}'
+                f"{instruction.qubits} = {tuple(mapped_qubits)} is not allowed as locus for '{instruction_name}'"
                 if qubit_mapping
-                else f'{instruction.qubits} not allowed as locus for {instruction.name}'
+                else f"'{instruction.qubits} is not allowed as locus for '{instruction_name}'"
             )
 
     @staticmethod
     def _validate_circuit_moves(
-        architecture: QuantumArchitectureSpecification,
+        architecture: DynamicQuantumArchitecture,
         circuit: Circuit,
         qubit_mapping: Optional[dict[str, str]] = None,
         validate_moves: MoveGateValidationMode = MoveGateValidationMode.STRICT,
@@ -454,7 +482,7 @@ class IQMClient:
             return
         move_gate = 'move'
         # Check if MOVE gates are allowed on this architecture
-        if move_gate not in architecture.operations:
+        if move_gate not in architecture.gates:
             if any(i.name == move_gate for i in circuit.instructions):
                 raise CircuitValidationError('MOVE instruction is not supported by the given device architecture.')
             return
@@ -464,9 +492,8 @@ class IQMClient:
         if validate_moves == MoveGateValidationMode.ALLOW_PRX:
             allowed_gates.add('prx')
 
-        # TODO use architecture.computational_resonators when available instead of relying on COMP_R prefix.
-        all_resonators = {q for q in architecture.qubits if q.startswith('COMP_R')}
-        all_qubits = set(architecture.qubits) - all_resonators
+        all_resonators = set(architecture.computational_resonators)
+        all_qubits = set(architecture.qubits)
         if qubit_mapping:
             reverse_mapping = {phys: log for log, phys in qubit_mapping.items()}
             all_resonators = {reverse_mapping[q] if q in reverse_mapping else q for q in all_resonators}
@@ -529,6 +556,7 @@ class IQMClient:
                 timeout=timeout_secs,
             )
         )
+        self._check_not_found_error(result)
         result.raise_for_status()
         return RunResult.from_dict(result.json())
 
@@ -541,6 +569,7 @@ class IQMClient:
             headers=self._default_headers(),
             timeout=timeout_secs,
         )
+        self._check_not_found_error(status_response)
         status_response.raise_for_status()
         status = status_response.json()
         if Status(status['status']) not in [Status.READY, Status.ABORTED, Status.DELETED, Status.FAILED]:
@@ -683,6 +712,7 @@ class IQMClient:
             )
         )
 
+        self._check_not_found_error(result)
         result.raise_for_status()
         try:
             run_result = RunStatus.from_dict(result.json())
@@ -753,7 +783,6 @@ class IQMClient:
             timeout_secs: network request timeout
 
         Raises:
-            HTTPException: HTTP exceptions
             JobAbortionError: if aborting the job failed
         """
         result = requests.post(
@@ -788,8 +817,10 @@ class IQMClient:
             timeout=timeout_secs,
         )
 
+        self._check_not_found_error(result)
         self._check_authentication_errors(result)
         result.raise_for_status()
+
         try:
             qa = QuantumArchitecture(**result.json()).quantum_architecture
         except (json.decoder.JSONDecodeError, KeyError) as e:
@@ -835,8 +866,10 @@ class IQMClient:
             timeout=timeout_secs,
         )
 
+        self._check_not_found_error(result)
         self._check_authentication_errors(result)
         result.raise_for_status()
+
         try:
             dqa = DynamicQuantumArchitecture(**result.json())
         except (json.decoder.JSONDecodeError, KeyError) as e:
@@ -879,3 +912,39 @@ class IQMClient:
             raise ClientAuthenticationError('Authentication is required.')
         if result.status_code == 401:
             raise ClientAuthenticationError(f'Authentication failed: {result.text}')
+
+    def _check_not_found_error(self, response: requests.Response) -> None:
+        """Raises HTTPError with appropriate message if ``response.status_code == 404``."""
+        if response.status_code == 404:
+            version_message = ''
+            if (version_incompatibility_msg := self._check_versions()) is not None:
+                version_message = (
+                    f' This may be caused by the server version not supporting this endpoint. '
+                    f'{version_incompatibility_msg}'
+                )
+            raise HTTPError(f'{response.url} not found.{version_message}', response=response)
+
+    def _check_versions(self) -> Optional[str]:
+        """Checks the client version against compatible client versions reported by server.
+
+        Returns:
+            A message about the versions being incompatible if they are,
+            None if they are compatible or if the version information could not be obtained.
+        """
+        versions_response = requests.get(
+            self._api.url(APIEndpoint.CLIENT_LIBRARIES),
+            headers=self._default_headers(),
+            timeout=REQUESTS_TIMEOUT,
+        )
+        if versions_response.status_code == 200:
+            compatible_versions = versions_response.json()['iqm-client']
+            min_version = parse(compatible_versions['min'])
+            max_version = parse(compatible_versions['max'])
+            client_version = parse(version('iqm-client'))
+            if client_version < min_version or client_version >= max_version:
+                return (
+                    f'Your IQM Client version {client_version} was built for a different version of IQM Server. '
+                    f'You might encounter issues. For the best experience, consider using a version '
+                    f'of IQM Client that satisfies {min_version} <= iqm-client < {max_version}.'
+                )
+        return None
