@@ -2,6 +2,56 @@
 Changelog
 =========
 
+Version 20.13
+=============
+
+* Fix package publishing from ci, no functional changes. `#160 <https://github.com/iqm-finland/iqm-client/pull/160>`_
+
+Version 20.12
+=============
+
+* Drop support for Python 3.9. `#159 <https://github.com/iqm-finland/iqm-client/pull/159>`_
+* Add optional security-scanned lockfile. `#159 <https://github.com/iqm-finland/iqm-client/pull/159>`_
+
+Version 20.11
+=============
+
+* Add ``RESONANCE_COCOS_V1`` API variant option for Resonance Cocos API v1. `#158 <https://github.com/iqm-finland/iqm-client/pull/158>`_
+* Add ``IQMClient::get_run_counts`` method. `#158 <https://github.com/iqm-finland/iqm-client/pull/158>`_
+* Add ``IQMClient::get_supported_client_libraries`` method. `#158 <https://github.com/iqm-finland/iqm-client/pull/158>`_
+
+Version 20.10
+=============
+
+* Fix Sphinx documentation build warnings `#155 <https://github.com/iqm-finland/iqm-client/pull/155>`_
+* Enable Sphinx documentation build option to treat warnings as errors `#155 <https://github.com/iqm-finland/iqm-client/pull/155>`_
+
+Version 20.9
+============
+
+* Added Python 3.12 support `#154 <https://github.com/iqm-finland/iqm-client/pull/154>`_
+* Python 3.9 support is deprecated and will be removed in the future
+
+Version 20.8
+============
+
+* Add ``dd_mode`` and ``dd_strategy`` to ``CircuitCompilationOptions`` and ``RunRequest`` `#152 <https://github.com/iqm-finland/iqm-client/pull/152>`_
+
+Version 20.7
+============
+
+* Fix typo of `QUALITY` in `src/iqm/iqm_client/api.py` `#149 <https://github.com/iqm-finland/iqm-client/pull/149>`_
+
+Version 20.6
+============
+
+* Improve version compatibility check to avoid it preventing usage of the client in any situation. `#150 <https://github.com/iqm-finland/iqm-client/pull/150>`_
+
+Version 20.5
+============
+
+* Fixed client version compatibility check. `#148 <https://github.com/iqm-finland/iqm-client/pull/148>`_
+
 Version 20.4
 ============
 * ``active_reset_cycles`` added to ``CircuitCompilationOptions`` (in 20.2 it was only added to ``RunRequest`` making it
@@ -36,7 +86,7 @@ Version 19.0
 * Allow mid-circuit measurements and classically controlled PRX gates.
   `#136 <https://github.com/iqm-finland/iqm-client/pull/136>`_
 * Deprecated native operations names ``phased_rx`` and ``measurement`` removed,
-   use ``prx`` and ``measure`` instead.
+  use ``prx`` and ``measure`` instead.
   `#136 <https://github.com/iqm-finland/iqm-client/pull/136>`_
 
 Version 18.8
@@ -154,6 +204,8 @@ Version 16.1
 ============
 
 * Remove multiversion documentation. `#115 <https://github.com/iqm-finland/iqm-client/pull/115>`_
+
+* FiQCI: Support attaching `PROJECT_ID` and `SLURM_JOB_ID` environment variable content to circuit metadata.
 
 Version 16.0
 ============
