@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# pylint: disable=too-many-lines
 r"""
 Client for connecting to the IQM quantum computer server interface.
 """
@@ -49,11 +50,13 @@ from iqm.iqm_client.models import (
     Circuit,
     CircuitBatch,
     CircuitCompilationOptions,
+    ClientLibrary,
     DynamicQuantumArchitecture,
     Instruction,
     MoveGateValidationMode,
     QuantumArchitecture,
     QuantumArchitectureSpecification,
+    RunCounts,
     RunRequest,
     RunResult,
     RunStatus,
@@ -116,9 +119,10 @@ class IQMClient:
             username,
             password,
         )
+        version_string = 'iqm-client'
         self._signature = f'{platform.platform(terse=True)}'
         self._signature += f', python {platform.python_version()}'
-        self._signature += f', iqm-client {version("iqm-client")}'
+        self._signature += f', iqm-client {version(version_string)}'
         if client_signature:
             self._signature += f', {client_signature}'
         self._architecture: QuantumArchitectureSpecification | None = None
@@ -253,6 +257,8 @@ class IQMClient:
             move_validation_mode=options.move_gate_validation,
             move_gate_frame_tracking_mode=options.move_gate_frame_tracking,
             active_reset_cycles=options.active_reset_cycles,
+            dd_mode=options.dd_mode,
+            dd_strategy=options.dd_strategy,
         )
 
     def submit_run_request(self, run_request: RunRequest) -> UUID:
@@ -647,15 +653,17 @@ class IQMClient:
                 'metadata': {
                     '`': calibration_set_id,
                     'circuits_batch': circuits_batch,
-                    'parameters': None
-                    if result.status_code == 404
-                    else {
-                        'shots': request_parameters['shots'],
-                        'max_circuit_duration_over_t2': request_parameters['max_circuit_duration_over_t2'],
-                        'heralding_mode': request_parameters['heralding_mode'],
-                        'move_validation_mode': request_parameters['move_validation_mode'],
-                        'move_gate_frame_tracking_mode': request_parameters['move_gate_frame_tracking_mode'],
-                    },
+                    'parameters': (
+                        None
+                        if result.status_code == 404
+                        else {
+                            'shots': request_parameters['shots'],
+                            'max_circuit_duration_over_t2': request_parameters['max_circuit_duration_over_t2'],
+                            'heralding_mode': request_parameters['heralding_mode'],
+                            'move_validation_mode': request_parameters['move_validation_mode'],
+                            'move_gate_frame_tracking_mode': request_parameters['move_gate_frame_tracking_mode'],
+                        }
+                    ),
                     'timestamps': {datapoint['stage']: datapoint['timestamp'] for datapoint in timeline},
                 },
             }
@@ -928,18 +936,19 @@ class IQMClient:
         """Checks the client version against compatible client versions reported by server.
 
         Returns:
-            A message about the versions being incompatible if they are,
-            None if they are compatible or if the version information could not be obtained.
+            A message about client incompatibility with the server if the versions are incompatible or if the
+            compatibility could not be confirmed, None if they are compatible.
         """
-        versions_response = requests.get(
-            self._api.url(APIEndpoint.CLIENT_LIBRARIES),
-            headers=self._default_headers(),
-            timeout=REQUESTS_TIMEOUT,
-        )
-        if versions_response.status_code == 200:
-            compatible_versions = versions_response.json()['iqm-client']
-            min_version = parse(compatible_versions['min'])
-            max_version = parse(compatible_versions['max'])
+        try:
+            libraries = self.get_supported_client_libraries()
+            compatible_iqm_client = libraries.get(
+                'iqm-client',
+                libraries.get('iqm_client'),
+            )
+            if compatible_iqm_client is None:
+                return 'Could not verify IQM Client compatibility with the server. You might encounter issues.'
+            min_version = parse(compatible_iqm_client.min)
+            max_version = parse(compatible_iqm_client.max)
             client_version = parse(version('iqm-client'))
             if client_version < min_version or client_version >= max_version:
                 return (
@@ -947,4 +956,64 @@ class IQMClient:
                     f'You might encounter issues. For the best experience, consider using a version '
                     f'of IQM Client that satisfies {min_version} <= iqm-client < {max_version}.'
                 )
-        return None
+            return None
+        except Exception as e:  # pylint: disable=broad-except
+            # we don't want the version check to prevent usage of IQMClient in any situation
+            check_error = e
+        return f'Could not verify IQM Client compatibility with the server. You might encounter issues. {check_error}'
+
+    def get_run_counts(self, job_id: UUID, *, timeout_secs: float = REQUESTS_TIMEOUT) -> RunCounts:
+        """Query the counts of an executed job.
+
+        Args:
+            job_id: id of the job to query
+            timeout_secs: network request timeout
+
+        Returns:
+            counts strings dictionary
+
+        Raises:
+            CircuitExecutionError: IQM server specific exceptions
+            HTTPException: HTTP exceptions
+        """
+        result = self._retry_request_on_error(
+            lambda: requests.get(
+                self._api.url(APIEndpoint.GET_JOB_COUNTS, str(job_id)),
+                headers=self._default_headers(),
+                timeout=timeout_secs,
+            )
+        )
+
+        self._check_not_found_error(result)
+        result.raise_for_status()
+        try:
+            run_counts = RunCounts.from_dict(result.json())
+        except (json.decoder.JSONDecodeError, KeyError) as e:
+            raise CircuitExecutionError(f'Invalid response: {result.text}, {e}') from e
+
+        return run_counts
+
+    def get_supported_client_libraries(self, timeout_secs: float = REQUESTS_TIMEOUT) -> dict[str, ClientLibrary]:
+        """Retrieves information about supported client libraries from the server.
+
+        Args:
+            timeout_secs: network request timeout in seconds
+
+        Returns:
+            Dictionary mapping library identifiers to their metadata
+
+        Raises:
+            HTTPError: HTTP exceptions
+            ClientAuthenticationError: if authentication fails
+        """
+        result = requests.get(
+            self._api.url(APIEndpoint.CLIENT_LIBRARIES),
+            headers=self._default_headers(),
+            timeout=timeout_secs,
+        )
+
+        self._check_not_found_error(result)
+        self._check_authentication_errors(result)
+        result.raise_for_status()
+
+        return {key: ClientLibrary.model_validate(value) for key, value in result.json().items()}

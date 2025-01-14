@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# pylint: disable=too-many-lines
 """This module contains the data models used by IQMClient."""
 
 from __future__ import annotations
@@ -245,9 +246,8 @@ class Instruction(BaseModel):
         """Check if the name of instruction is set to one of the supported quantum operations."""
         name = value
         if name not in _SUPPORTED_OPERATIONS:
-            raise ValueError(
-                f'Unknown operation "{name}". ' f'Supported operations are \"{", ".join(_SUPPORTED_OPERATIONS)}\"'
-            )
+            message = ', '.join(_SUPPORTED_OPERATIONS)
+            raise ValueError(f'Unknown operation "{name}". Supported operations are "{message}"')
         return name
 
     @field_validator('implementation')
@@ -294,9 +294,10 @@ class Instruction(BaseModel):
                 f'but {tuple(submitted_arg_names)} were given'
             )
         if not submitted_arg_names <= allowed_arg_names:
+            message = tuple(allowed_arg_names) if allowed_arg_names else 'no'
             raise ValueError(
                 f'The operation "{name}" allows '
-                f'{tuple(allowed_arg_names) if allowed_arg_names else "no"} argument(s), '
+                f'{message} argument(s), '
                 f'but {tuple(submitted_arg_names)} were given'
             )
 
@@ -487,7 +488,7 @@ class QuantumArchitectureSpecification(BaseModel):
         another architecture specification.
 
         Returns:
-             True if the operation and the loci are equivalent.
+            True if the operation and the loci are equivalent.
         """
         return QuantumArchitectureSpecification.compare_operations(self.operations, other.operations)
 
@@ -496,7 +497,7 @@ class QuantumArchitectureSpecification(BaseModel):
         """Compares the given operation sets.
 
         Returns:
-             True if the operation and the loci are equivalent.
+            True if the operation and the loci are equivalent.
         """
         if set(ops1) != set(ops2):
             return False
@@ -557,7 +558,7 @@ class GateInfo(BaseModel):
         The sorting of individual locus components is first done alphabetically based on their
         non-numeric part, and then components with the same non-numeric part are sorted numerically.
         An example of loci sorted this way would be:
-        (
+
             ('QB1', 'QB2'),
             ('QB2', 'COMPR1'),
             ('QB2', 'QB3'),
@@ -565,7 +566,7 @@ class GateInfo(BaseModel):
             ('QB3', 'COMPR2'),
             ('QB3', 'QB1'),
             ('QB10', 'QB2'),
-        )
+
         """
         loci_set = set(locus for impl in self.implementations.values() for locus in impl.loci)
         loci_sorted = sorted(loci_set, key=lambda locus: tuple(map(_component_sort_key, locus)))
@@ -638,6 +639,76 @@ class MoveGateFrameTrackingMode(str, Enum):
     """Do not perform any MOVE gate frame tracking. The user is expected to do these manually."""
 
 
+class DDMode(str, Enum):
+    """Dynamical Decoupling (DD) mode for circuit execution."""
+
+    DISABLED: Final[str] = 'disabled'
+    """Do not apply dynamical decoupling."""
+    ENABLED: Final[str] = 'enabled'
+    """Apply dynamical decoupling."""
+
+
+PRXSequence = list[tuple[float, float]]
+"""A sequence of PRX gates. A generic PRX gate is defined by rotation angle and phase angle, Theta and Phi,
+respectively."""
+
+
+@dataclass
+class DDStrategy:
+    """Describes a particular dynamical decoupling strategy.
+
+    The current standard DD stategy can be found in :attr:`.STANDARD_DD_STRATEGY`,
+    but users can use this class to provide their own dynamical decoupling strategies.
+
+    See Ezzell et al., Phys. Rev. Appl. 20, 064027 (2022) for information on DD sequences.
+    """
+
+    merge_contiguous_waits: bool = True
+    """Merge contiguous ``Wait`` instructions into one if they are separated only by ``Block`` instructions."""
+
+    target_qubits: Optional[frozenset[str]] = None
+    """Qubits on which dynamical decoupling should be applied. If ``None``, all qubits are targeted."""
+
+    skip_leading_wait: bool = True
+    """Skip processing leading ``Wait`` instructions."""
+
+    skip_trailing_wait: bool = True
+    """Skip processing trailing ``Wait`` instructions."""
+
+    gate_sequences: list[tuple[int, Union[str, PRXSequence], str]] = field(default_factory=list)
+    """Available decoupling gate sequences to chose from in this strategy.
+
+    Each sequence is defined by a tuple of ``(ratio, gate pattern, align)``:
+
+        * ratio: Minimal duration for the sequence (in PRX gate durations) as integer.
+
+        * gate pattern: Gate pattern can be defined in two ways. It can be a string containing "X" and "Y" characters,
+          encoding a PRX gate sequence. For example, "YXYX" corresponds to the
+          XY4 sequence, "XYXYYXYX" to the EDD sequence, etc. If more flexibility is needed, a gate pattern can be
+          defined as a sequence of PRX gate argument tuples (that contain a rotation angle and a phase angle). For
+          example, sequence "YX" could be written as ``[(math.pi, math.pi / 2), (math.pi, 0)]``.
+
+        * align: Controls the alignment of the sequence within the time window it is inserted in. Supported values:
+
+          - "asap": Corresponds to a ASAP-aligned sequence with no waiting time before the first pulse.
+          - "center": Corresponds to a symmetric sequence.
+          - "alap": Corresponds to a ALAP-aligned sequence.
+
+    The Dynamical Decoupling algorithm uses the best fitting gate sequence by first sorting them
+    by ``ratio`` in descending order. Then the longest fitting pattern is determined by comparing ``ratio``
+    with the duration of the time window divided by the PRX gate duration.
+    """
+
+
+STANDARD_DD_STRATEGY = DDStrategy(gate_sequences=[(9, 'XYXYYXYX', 'asap'), (5, 'YXYX', 'asap'), (2, 'XX', 'center')])
+"""The default DD strategy uses the following gate sequences:
+
+* Simple symmetric CPMG sequence for short idling times.
+* Asymmetric (left-aligned) universal XY4 sequence for medium idling times.
+* Asymmetric (left-aligned) universal EDD sequence for longer idling times.
+"""
+
+
 @dataclass(frozen=True)
 class CircuitCompilationOptions:
     """Various discrete options for quantum circuit compilation to pulse schedule."""
@@ -657,10 +728,14 @@ class CircuitCompilationOptions:
     """MOVE gate frame tracking mode for circuit compilation. This options is ignored on devices that do not support
         MOVE and for circuits that do not contain MOVE gates."""
     active_reset_cycles: Optional[int] = None
-    """Number of active ``reset`` operations inserted at the beginning of each circuit for each active qubit. 
+    """Number of active ``reset`` operations inserted at the beginning of each circuit for each active qubit.
     ``None`` means active reset is not used but instead reset is done by waiting (relaxation). Integer values smaller
     than 1 result in neither active nor reset by wait being used, in which case any reset operations must be explicitly
     added in the circuit."""
+    dd_mode: DDMode = DDMode.DISABLED
+    """Control whether dynamical decoupling should be enabled or disabled during the execution."""
+    dd_strategy: Optional[DDStrategy] = None
+    """A particular dynamical decoupling strategy to be used during the execution."""
 
     def __post_init__(self):
         """Validate the options."""
@@ -704,10 +779,14 @@ class RunRequest(BaseModel):
     move_gate_frame_tracking_mode: MoveGateFrameTrackingMode = Field(MoveGateFrameTrackingMode.FULL)
     """Which method of MOVE gate frame tracking to use for circuit compilation."""
     active_reset_cycles: Optional[int] = Field(None)
-    """Number of active ``reset`` operations inserted at the beginning of each circuit for each active qubit. 
+    """Number of active ``reset`` operations inserted at the beginning of each circuit for each active qubit.
     ``None`` means active reset is not used but instead reset is done by waiting (relaxation). Integer values smaller
     than 1 result in neither active nor reset by wait being used, in which case any reset operations must be explicitly
     added in the circuit."""
+    dd_mode: DDMode = Field(DDMode.DISABLED)
+    """Control whether dynamical decoupling should be enabled or disabled during the execution."""
+    dd_strategy: Optional[DDStrategy] = Field(None)
+    """A particular dynamical decoupling strategy to be used during the execution."""
 
 
 CircuitMeasurementResults = dict[str, list[list[int]]]
@@ -727,6 +806,8 @@ class JobParameters(BaseModel):
     heralding_mode: HeraldingMode = Field(HeraldingMode.NONE)
     move_validation_mode: MoveGateValidationMode = Field(MoveGateValidationMode.STRICT)
     move_gate_frame_tracking_mode: MoveGateFrameTrackingMode = Field(MoveGateFrameTrackingMode.FULL)
+    dd_mode: DDMode = Field(DDMode.DISABLED)
+    dd_strategy: Optional[DDStrategy] = Field(None)
 
 
 class Metadata(BaseModel):
@@ -771,6 +852,24 @@ class Metadata(BaseModel):
         if self.request is not None:
             return self.request.heralding_mode
         raise ValueError('No heralding mode information available in the metadata')
+
+    @property
+    def dd_mode(self) -> DDMode:
+        """Return the dynamical decoupling mode requested with the job."""
+        if self.parameters is not None:
+            return self.parameters.dd_mode
+        if self.request is not None:
+            return self.request.dd_mode
+        raise ValueError('No dynamical decoupling mode information available in the metadata')
+
+    @property
+    def dd_strategy(self) -> Optional[DDStrategy]:
+        """Return the dynamical decoupling strategy used with the job."""
+        if self.parameters is not None:
+            return self.parameters.dd_strategy
+        if self.request is not None:
+            return self.request.dd_strategy
+        raise ValueError('No dynamical decoupling strategy information available in the metadata')
 
 
 class Status(str, Enum):
@@ -862,3 +961,61 @@ class RunStatus(BaseModel):
         """
         input_copy = inp.copy()
         return RunStatus(status=Status(input_copy.pop('status')), **input_copy)
+
+
+class Counts(BaseModel):
+    """Measurement results in the counts representation"""
+
+    measurement_keys: list[str]
+    """measurement keys in the order they are concatenated to form the states in counts"""
+    counts: dict[str, int]
+    """counts as a dictionary mapping states represented as bitstrings to the number of shots they were measured"""
+
+
+class RunCounts(BaseModel):
+    """Measurement counts of a circuit execution job."""
+
+    status: Status = Field(...)
+    """current status of the job, in ``{'pending compilation', 'pending execution', 'ready', 'failed', 'aborted'}``"""
+    counts_batch: Optional[list[Counts]] = Field(
+        None,
+        description="""Measurement results in histogram representation.
+    The `measurement_keys` list provides the order of the measurment keys for the repesentation of the states in the keys
+    of the `counts` dictionary. As an example if `measurement_keys` is `['mk_1', 'mk2']` and `mk_1` refers to `QB1` and `mk_2`
+    refers to `QB3` and `QB5` then counts could contains keys such as '010' with `QB1` in the 0, `QB3` in the 1 and `QB5` in
+    the 0 state.""",
+    )
+
+    @staticmethod
+    def from_dict(inp: dict[str, Union[str, dict, list, None]]) -> RunCounts:
+        """Parses the result from a dict.
+
+        Args:
+            inp: value to parse, has to map to RunCounts
+
+        Returns:
+            parsed job status
+
+        """
+        input_copy = inp.copy()
+        return RunCounts(status=Status(input_copy.pop('status')), **input_copy)
+
+
+class ClientLibrary(BaseModel):
+    """Represents a client library with its metadata.
+
+    Args:
+        name: display name of the client library.
+        package_name: name of the package as published in package repositories.
+        repo_url: URL to the source code repository.
+        package_url: URL to the package in the package repository.
+        min: minimum supported version.
+        max: maximum supported version.
+    """
+
+    name: str
+    package_name: Optional[str] = Field(None)
+    repo_url: Optional[str] = Field(None)
+    package_url: Optional[str] = Field(None)
+    min: str
+    max: str
