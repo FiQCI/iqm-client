@@ -69,6 +69,21 @@ REQUESTS_TIMEOUT = float(os.environ.get('IQM_CLIENT_REQUESTS_TIMEOUT', 60.0))
 DEFAULT_TIMEOUT_SECONDS = 900
 SECONDS_BETWEEN_CALLS = float(os.environ.get('IQM_CLIENT_SECONDS_BETWEEN_CALLS', 1.0))
 
+def update_batch_circuit_metadata(circuit_metadata, circuits):
+    """Iterates over circuits in batch and extends circuit metadata dictionary with
+    data from circuit_metadata
+    Args:
+        circuit_metadata: Key-value pairs representing additional circuit metadata
+        circuits: list of circuits for which metadata should be updated
+    Returns:
+        new list of circuits with updated metadata
+    """
+    for circuit in circuits:
+        if not hasattr(circuit, 'metadata') or circuit.metadata is None:
+            circuit.metadata = {}
+        for k, v in circuit_metadata.items():
+            circuit.metadata[k] = v
+    return circuits
 
 class IQMClient:
     """Provides access to IQM quantum computers.
@@ -97,6 +112,7 @@ class IQMClient:
     for values given as environment variables as for keyword arguments.
     """
 
+    # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
         url: str,
@@ -126,6 +142,9 @@ class IQMClient:
             self._signature += f', {client_signature}'
         self._architecture: QuantumArchitectureSpecification | None = None
         self._dynamic_architectures: dict[UUID, DynamicQuantumArchitecture] = {}
+
+        self._project_id = os.environ.get('PROJECT_ID', None)
+        self._slurm_job_id = os.environ.get('SLURM_JOB_ID', None)
 
         if api_variant is None:
             env_var = os.environ.get('IQM_CLIENT_API_VARIANT')
@@ -245,6 +264,13 @@ class IQMClient:
         self._validate_circuit_instructions(
             architecture, circuits, qubit_mapping, validate_moves=options.move_gate_validation
         )
+
+        additional_metadata = {'project_id': self._project_id, 'slurm_job_id': self._slurm_job_id}
+        # Filter the metadata
+        additional_metadata = {k: v for k, v in additional_metadata.items() if v is not None}
+        # Attach metadata to circuits metadata
+        circuits = update_batch_circuit_metadata(additional_metadata, circuits)
+
         return RunRequest(
             qubit_mapping=serialized_qubit_mapping,
             circuits=circuits,
